@@ -1,0 +1,16 @@
+[package]
+name = "weather-radar"
+version = "0.1.0"
+edition = "2021"
+description = "NWS forecast + live radar GUI for Alachua, FL — public domain"
+
+[[bin]]
+name = "weather-radar"
+path = "src/main.rs"
+
+[dependencies]
+eframe  = "0.28"
+egui    = "0.28"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+serde_json = "1"
+image   = { version = "0.25", default-features = false, features = ["png", "gif", "jpeg"] }
