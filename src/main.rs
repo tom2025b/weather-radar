@@ -19,14 +19,19 @@ const USER_AGENT: &str = "weather-radar/0.1 (thomaslane2025@gmail.com)";
 
 /// NOAA WMS base-reflectivity composite — CONUS
 /// EPSG:4326 axis order for WMS 1.3.0: minLat,minLon,maxLat,maxLon
-const RADAR_URL: &str =
-    "https://opengeo.ncep.noaa.gov/geoserver/conus/conus_bref_qcd/ows\
-     ?service=WMS&version=1.3.0&request=GetMap\
-     &layers=conus_bref_qcd\
-     &CRS=EPSG:4326\
-     &BBOX=27.5,-86.0,31.5,-80.0\
-     &WIDTH=640&HEIGHT=427\
-     &FORMAT=image/png";
+/// Returns a URL with a ±2.5° lat / ±3.0° lon box centred on the given coords.
+fn radar_url(lat: f64, lon: f64) -> String {
+    format!(
+        "https://opengeo.ncep.noaa.gov/geoserver/conus/conus_bref_qcd/ows\
+         ?service=WMS&version=1.3.0&request=GetMap\
+         &layers=conus_bref_qcd\
+         &CRS=EPSG:4326\
+         &BBOX={},{},{},{}\
+         &WIDTH=640&HEIGHT=427\
+         &FORMAT=image/png",
+        lat - 2.5, lon - 3.0, lat + 2.5, lon + 3.0
+    )
+}
 
 // ── Data types ─────────────────────────────────────────────────────────────
 
@@ -563,7 +568,7 @@ fn do_fetch(shared: &Arc<Mutex<AppData>>) {
     }
 
     set_status(shared, "Fetching NOAA radar…".into());
-    match fetch_radar() {
+    match fetch_radar(lat, lon) {
         Ok(bytes) => {
             let mut d = shared.lock().unwrap();
             d.radar_bytes = Some(bytes);
@@ -633,12 +638,177 @@ fn fetch_forecast(lat: f64, lon: f64) -> Result<(f64, Vec<ForecastPeriod>), Stri
     Ok((current_temp, periods))
 }
 
-fn fetch_radar() -> Result<Vec<u8>, String> {
+fn fetch_radar(lat: f64, lon: f64) -> Result<Vec<u8>, String> {
     let bytes = make_client()?
-        .get(RADAR_URL)
+        .get(radar_url(lat, lon))
         .send().map_err(|e| e.to_string())?
         .bytes().map_err(|e| e.to_string())?;
     Ok(bytes.to_vec())
+}
+
+// ── Text mode ──────────────────────────────────────────────────────────────
+
+fn roast(temp: i64, short_forecast: &str, humidity: Option<i64>, precip: Option<i64>) -> &'static str {
+    let fc = short_forecast.to_lowercase();
+    let hot   = temp >= 95;
+    let warm  = temp >= 85;
+    let nice  = temp >= 68 && temp < 85;
+    let chilly= temp >= 50 && temp < 68;
+    let cold  = temp >= 35 && temp < 50;
+    let polar = temp < 35;
+    let rainy = fc.contains("rain") || fc.contains("shower") || fc.contains("storm") || precip.unwrap_or(0) > 50;
+    let humid = humidity.unwrap_or(0) > 80;
+    let sunny = fc.contains("sunny") || fc.contains("clear");
+    let fog   = fc.contains("fog");
+    let snow  = fc.contains("snow") || fc.contains("blizzard") || fc.contains("flurr");
+    let thunder = fc.contains("thunder") || fc.contains("storm");
+
+    if thunder        { return "There's a thunderstorm coming. Unplug your stuff. Say your prayers. Maybe both."; }
+    if snow && polar  { return "It's snowing AND freezing. Nature has chosen violence today."; }
+    if snow           { return "Snow. Great. Hope you own exactly one snow shovel and it's in the garage behind everything."; }
+    if fog            { return "Foggy. Perfect conditions for making one extremely bad decision you can't see coming."; }
+    if hot && humid   { return "It's hot AND the air is soup. Congratulations, you live inside a mouth."; }
+    if hot && rainy   { return "Hot and raining. The weather gods are mad at you specifically."; }
+    if hot            { return "You could slow-cook a brisket on the sidewalk. The sun is not your friend."; }
+    if warm && rainy  { return "Warm and rainy. Your shoes WILL be soaked and you WILL pretend that's fine."; }
+    if warm && humid  { return "It's warm and the humidity is a physical object. Try not to melt."; }
+    if warm && sunny  { return "Actually nice out. This won't last. Enjoy it before reality resumes."; }
+    if warm           { return "Warm and overcast. The sky is being passive-aggressive again."; }
+    if nice && sunny  { return "Genuinely pleasant. The weather is doing its job. Give it a gold star."; }
+    if nice && rainy  { return "Light rain in perfect weather. Classic. You brought the wrong jacket, didn't you."; }
+    if nice           { return "Pretty decent out. The kind of day that tricks you into forgetting everything is bad."; }
+    if chilly && rainy{ return "Cold rain. The worst kind. You're going to need a towel just to check the mail."; }
+    if chilly && sunny{ return "Cool and sunny. Trick weather. Feels fine until you stop moving and freeze instantly."; }
+    if chilly         { return "Chilly. Your body is already negotiating with you about going outside."; }
+    if cold && sunny  { return "Sunny but cold. Cosmetic warmth. The sun is basically just a decoration today."; }
+    if cold && rainy  { return "Cold and raining. A classic combo for everyone who hates themselves a little."; }
+    if cold           { return "It's cold enough to justify the thermostat war you're about to start."; }
+    if polar          { return "It's below freezing. Stay inside. Drink something hot. Blame the government."; }
+    if rainy          { return "It's going to rain. Your umbrella is in the car, isn't it."; }
+    if humid          { return "High humidity. The air would like you to know it's doing its best."; }
+    "Weather: technically exists. Forecast: whatever. Dress accordingly."
+}
+
+fn precip_text(precip: Option<i64>) -> String {
+    match precip {
+        Some(p) => format!("rain {:>3}%", p),
+        None    => "rain  --%".to_string(),
+    }
+}
+
+fn run_text_mode(location_arg: Option<&str>) {
+    use std::io::{self, IsTerminal, Write};
+
+    let query: String = if let Some(q) = location_arg {
+        q.to_string()
+    } else if io::stdin().is_terminal() {
+        print!("  Enter ZIP code or city: ");
+        io::stdout().flush().ok();
+        let mut buf = String::new();
+        io::stdin().read_line(&mut buf).unwrap_or(0);
+        let trimmed = buf.trim().to_string();
+        if trimmed.is_empty() {
+            eprintln!("  No location provided. Usage: weather-radar --text <ZIP or city>");
+            std::process::exit(1);
+        }
+        trimmed
+    } else {
+        eprintln!("  No location provided. Usage: weather-radar --text <ZIP or city>");
+        std::process::exit(1);
+    };
+
+    eprintln!("  Locating \"{}\"…", query);
+    let (lat, lon, label) = match geocode(&query) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("  Geocode error: {}", e); std::process::exit(1); }
+    };
+
+    eprintln!("  Fetching NWS forecast…");
+    let (current_temp, periods) = match fetch_forecast(lat, lon) {
+        Ok(r) => r,
+        Err(e) => { eprintln!("  Forecast error: {}", e); std::process::exit(1); }
+    };
+
+    // ── Build output buffer (printed + saved to file) ───────────────────────
+    use std::fmt::Write as FmtWrite;
+    let mut out = String::new();
+    let bar = "━".repeat(62);
+
+    writeln!(out, "\n  Weather — {}  ({:.4}, {:.4})", label, lat, lon).ok();
+    writeln!(out, "  {}", bar).ok();
+    writeln!(out, "  Now: {:.1}°F\n", current_temp).ok();
+
+    if let Some(today) = periods.first() {
+        let warr = wind_arrow(&today.wind_direction);
+        writeln!(out, "  {} {}°{}  {}",
+            today.name, today.temperature, today.unit, today.short_forecast).ok();
+        write!(out, "  💨 {} {} {}", warr, today.wind_direction, today.wind_speed).ok();
+        write!(out, "   {}", precip_text(today.precip_chance)).ok();
+        if let Some(h) = today.humidity { write!(out, "   💧 {}%", h).ok(); }
+        writeln!(out).ok();
+
+        if !today.detailed_forecast.is_empty() {
+            let words: Vec<&str> = today.detailed_forecast.split_whitespace().collect();
+            let mut line = String::from("  ");
+            for w in &words {
+                if line.len() + w.len() + 1 > 64 {
+                    writeln!(out, "{}", line).ok();
+                    line = format!("  {}", w);
+                } else {
+                    if line.len() > 2 { line.push(' '); }
+                    line.push_str(w);
+                }
+            }
+            if line.len() > 2 { writeln!(out, "{}", line).ok(); }
+        }
+        writeln!(out).ok();
+        let burn = roast(today.temperature, &today.short_forecast, today.humidity, today.precip_chance);
+        writeln!(out, "  🔥 {}", burn).ok();
+        writeln!(out).ok();
+    }
+
+    writeln!(out, "  {}", bar).ok();
+    writeln!(out, "  {:>6}  {:>4}  {:>4}  {:<22}  {}", "Day", "Hi", "Lo", "Forecast", "Precip").ok();
+    writeln!(out, "  {}", bar).ok();
+
+    let daytime: Vec<&ForecastPeriod> = periods.iter().filter(|p| p.is_daytime).take(7).collect();
+    for dp in &daytime {
+        let night_temp = periods.iter()
+            .find(|p| !p.is_daytime && p.name.starts_with(dp.name.split_whitespace().next().unwrap_or("")))
+            .or_else(|| {
+                let idx = periods.iter().position(|p| std::ptr::eq(p as *const _, *dp as *const _)).unwrap_or(0);
+                periods.get(idx + 1).filter(|p| !p.is_daytime)
+            });
+        let lo = night_temp.map(|p| format!("{:>4}", p.temperature)).unwrap_or("  --".to_string());
+        writeln!(out, "  {:>6}  {:>3}°  {}°  {:<22}  {}",
+            abbrev_day(&dp.name),
+            dp.temperature,
+            lo,
+            short_words(&dp.short_forecast, 3),
+            precip_text(dp.precip_chance),
+        ).ok();
+    }
+
+    writeln!(out, "\n  {}", bar).ok();
+    writeln!(out, "  Radar (NOAA — centred on your location):").ok();
+    writeln!(out, "  {}", radar_url(lat, lon)).ok();
+    writeln!(out, "  {}\n", bar).ok();
+
+    // ── Print to terminal ───────────────────────────────────────────────────
+    print!("{}", out);
+
+    // ── Save to ~/weather-<zip>.txt ─────────────────────────────────────────
+    let safe: String = query.chars()
+        .map(|c| if c.is_alphanumeric() { c.to_ascii_lowercase() } else { '-' })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let path = format!("{}/weather-{}.txt", home, safe);
+    match std::fs::write(&path, &out) {
+        Ok(_)  => eprintln!("  Saved → {}", path),
+        Err(e) => eprintln!("  Could not save file: {}", e),
+    }
 }
 
 // ── Background refresh loop ────────────────────────────────────────────────
@@ -653,6 +823,20 @@ fn refresh_loop(shared: Arc<Mutex<AppData>>) {
 // ── Entry point ────────────────────────────────────────────────────────────
 
 fn main() {
+    let args: Vec<String> = std::env::args().collect();
+    let text_flag = args.iter().skip(1)
+        .any(|a| a == "--text" || a == "--no-gui" || a == "-t");
+    let no_display = std::env::var("DISPLAY").unwrap_or_default().is_empty()
+        && std::env::var("WAYLAND_DISPLAY").unwrap_or_default().is_empty();
+
+    if text_flag || no_display {
+        let location_arg = args.iter().skip(1)
+            .find(|a| !a.starts_with('-'))
+            .map(|s| s.as_str());
+        run_text_mode(location_arg);
+        return;
+    }
+
     let shared = Arc::new(Mutex::new(AppData {
         status: "Starting…".into(),
         ..Default::default()
